@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.output_batches import seed_demo_batches
 from app.routers import ROUTERS
 from app.store import store
 
@@ -94,3 +95,6 @@ def list_failures(module: str | None = None) -> dict[str, Any]:
 # 否则固定路径会被动态路径抢先匹配。
 for module in ROUTERS:
     app.include_router(module.router)
+
+# 演示批次在应用启动时写入一次，页面刷新后仍能从台账读到封口后的报告和历史记录。
+seed_demo_batches()

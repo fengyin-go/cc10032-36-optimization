@@ -1,7 +1,8 @@
 """检查点领域服务：管理流式任务的检查点策略。
 
 数据流角色: replay_engine → checkpoint_mgr（消费者+生产者）→ restore_plan（消费者）
-增强能力: 检查点创建/快照/恢复/对齐、状态校验、外部化存储路径管理、多检查点一致性验证
+增强能力: 检查点创建/快照/恢复/对齐、状态校验、外部化存储路径管理、多检查点一致性验证、
+批次封口闸门（读取封口后的聚合落库数据与完整性报告来源版本）
 """
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import hashlib
 import time
 from typing import Any
 
+from app.output_batches import batch_ledger
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -188,6 +190,67 @@ class CheckpointMgrService(BaseModuleService):
             })
         return result
 
+    # ---- 输出批次封口闸门 ----
+
+    def verify_batch_gate(self, batch_id: str, version: str | None = None) -> dict[str, Any]:
+        """读取封口后的聚合落库数据，确认批次无活动失败项后才允许下一批复用同一版本。
+
+        闸门同时返回完整性报告的来源版本与报告版本，供调用方对照批次口径。
+        """
+        gate = batch_ledger.checkpoint_gate(batch_id, version)
+        report = gate.get("report", {})
+        persisted = [
+            row.get("source_version")
+            for row in store.rows(self.MODULE)
+            if row.get("batch_id") == batch_id
+        ]
+        return {
+            **gate,
+            "report_source_version": report.get("source_version"),
+            "report_version_persisted": report.get("report_version"),
+            "checkpoint_versions": persisted,
+        }
+
+    def create_checkpoint_for_batch(
+        self, config_name: str, batch_id: str, operator_states: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """为一个已封口且无活动失败项的批次创建检查点快照。
+
+        未封口的批次不允许生成检查点，避免下一批在中间态上继续写同一版本。
+        """
+        gate = batch_ledger.checkpoint_gate(batch_id)
+        if not gate.get("allowed"):
+            return {
+                "ok": False,
+                "error": "批次未通过封口闸门：" + "；".join(gate.get("reasons", [])),
+                "gate": gate,
+            }
+        report = gate["report"]
+        states = operator_states or {
+            "batch": {
+                "batch_id": batch_id,
+                "source_version": report["source_version"],
+                "report_version": report["report_version"],
+                "complete": report["complete"],
+                "abandoned_partitions": report["abandoned_partitions"],
+            }
+        }
+        result = self.create_checkpoint(config_name, states)
+        if result.get("ok"):
+            for row in store.rows(self.MODULE):
+                if row.get("checkpoint_id") == result["checkpoint_id"]:
+                    row["batch_id"] = batch_id
+                    row["source_version"] = report["source_version"]
+                    row["report_version"] = report["report_version"]
+                    break
+            result["gate"] = gate
+        return result
+
+    def list_batch_reports(self, task_name: str | None = None,
+                           source: str | None = None) -> list[dict[str, Any]]:
+        """列出已封口的输出完整性报告，保留来源版本。"""
+        return batch_ledger.list_reports(task_name=task_name, source=source)
+
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
         rows = store.rows(self.MODULE)
@@ -197,4 +260,8 @@ class CheckpointMgrService(BaseModuleService):
             if r.get("checkpoint_id") and r.get("status") == "已启用"
         )
         base["pruned_snapshots"] = sum(1 for r in rows if r.get("_pruned"))
+        base["sealed_batch_snapshots"] = sum(
+            1 for r in rows
+            if r.get("batch_id") and r.get("status") == "已启用"
+        )
         return base
